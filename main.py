@@ -120,13 +120,13 @@ def parse_ay_match_container(content, class_name, source_name):
         info['status'] = 'unknown'
 
     # Extract team names from alt attributes in TM1 and TM2
-    # Home team: <div class='MT_Team TM1'>...<img alt="TeamName"...
+    # Use single-quoted regex strings to avoid escaping issues
     home_team_match = re.search(
-        r"<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']",
+        r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
         content, re.DOTALL | re.IGNORECASE
     )
     away_team_match = re.search(
-        r"<div[^>]*class=["\'][^"\']*MT_Team\s+TM2[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']",
+        r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM2[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
         content, re.DOTALL | re.IGNORECASE
     )
 
