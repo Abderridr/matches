@@ -13,9 +13,7 @@ logging.basicConfig(level=logging.INFO)
 ARABIC_SOURCES = {
     "shoofelmatch": "https://www.shoofelmatch.com/",
     "koora_online": "https://koora-online.tv/",
-    "koora99": "https://www.koora99.com/",
     "xkoora": "https://www.xkoora.net/",
-    "yalla_shoot_new": "https://yalla-shoots.com/",
     "livekoora": "https://livekoora.info/",
 }
 
@@ -29,15 +27,15 @@ HEADERS = {
 cache = {}
 CACHE_TTL = 300
 
-# ========== ADVANCED SCRAPER ==========
+# ========== UTILITIES ==========
 
 def fetch_url(url, headers=None, timeout=20, use_cache=True):
     now = time.time()
     cache_key = url
-    
+
     if use_cache and cache_key in cache and now - cache[cache_key]['time'] < CACHE_TTL:
         return cache[cache_key]['data']
-    
+
     try:
         r = requests.get(url, headers=headers or HEADERS, timeout=timeout, allow_redirects=True)
         r.raise_for_status()
@@ -48,173 +46,201 @@ def fetch_url(url, headers=None, timeout=20, use_cache=True):
         logging.error(f"Fetch failed for {url}: {e}")
         return None
 
-def extract_json_from_html(html):
-    """Extract JSON data embedded in script tags or variables"""
+def extract_matches_from_html_v2(html, source_name):
+    """Extract matches using specific AY_Match container patterns"""
     if not html:
         return []
-    
-    json_objects = []
-    
-    # Pattern 1: window.__INITIAL_STATE__ = {...}
-    patterns = [
-        r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-        r'window\.__DATA__\s*=\s*({.*?});',
-        r'window\.__APP__\s*=\s*({.*?});',
-        r'var\s+matches\s*=\s*({.*?});',
-        r'var\s+data\s*=\s*({.*?});',
-        r'const\s+matches\s*=\s*({.*?});',
-        r'\"matches\":\s*(\[.*?\])',
-        r'\"events\":\s*(\[.*?\])',
-        r'\"games\":\s*(\[.*?\])',
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, html, re.DOTALL)
-        for match in matches:
-            try:
-                # Try to parse as JSON
-                data = json.loads(match)
-                json_objects.append(data)
-            except json.JSONDecodeError:
-                # Might need to fix quotes
-                try:
-                    fixed = match.replace("'", '"')
-                    data = json.loads(fixed)
-                    json_objects.append(data)
-                except:
-                    pass
-    
-    return json_objects
 
-def extract_matches_from_html(html):
-    """Extract match data from HTML structure"""
-    if not html:
-        return []
-    
     matches = []
-    
-    # Remove scripts and styles for text extraction
-    clean_html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    clean_html = re.sub(r'<style[^>]*>.*?</style>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
-    
-    # Pattern 1: Look for common match container structures
-    # Many Arabic sites use divs with classes like: match-card, game-item, etc.
-    
-    # Extract all div/li/article elements that might contain matches
-    container_patterns = [
-        r'<(div|li|article|tr)[^>]*class=[\"\']([^\"\']*(?:match|game|مباراة|event|fixture|schedule|live|بث)[^\"\']*)[\"\'][^>]*>(.*?)</\1>',
-        r'<(div|li|article|tr)[^>]*id=[\"\']([^\"\']*(?:match|game|مباراة|event)[^\"\']*)[\"\'][^>]*>(.*?)</\1>',
-    ]
-    
-    for pattern in container_patterns:
-        containers = re.findall(pattern, clean_html, re.DOTALL | re.IGNORECASE)
-        for tag, class_name, content in containers:
-            match_info = parse_match_container(content, class_name)
-            if match_info:
-                matches.append(match_info)
-    
-    # Pattern 2: Look for table rows with match data
-    table_rows = re.findall(r'<tr[^>]*>(.*?)</tr>', clean_html, re.DOTALL | re.IGNORECASE)
-    for row in table_rows:
-        match_info = parse_match_container(row, "table-row")
+
+    # Pattern 1: Extract from AY_Match containers directly
+    match_containers = re.findall(
+        r'<[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>(.*?)</(?:div|li|article)>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+
+    for class_name, content in match_containers:
+        match_info = parse_ay_match_container(content, class_name, source_name)
         if match_info:
             matches.append(match_info)
-    
-    # Pattern 3: Extract text and look for structured match lines
-    text = re.sub(r'<[^>]+>', ' ', clean_html)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    # Look for patterns like: "Team A vs Team B - HH:MM - Channel"
-    # Arabic patterns: "الفريق الأول ضد الفريق الثاني - الساعة - القناة"
-    
-    # Pattern: Team names (Arabic or English) + time + channel
-    match_patterns = [
-        # English: Team A vs Team B HH:MM
-        r'([A-Za-z\s]{3,25})\s+(?:vs|VS|Vs|v|V)\s+([A-Za-z\s]{3,25}).*?(\d{1,2}:\d{2})',
-        # Arabic: Team A ضد Team B
-        r'([\u0600-\u06FF\s]{2,20})\s+(?:ضد|vs|VS)\s+([\u0600-\u06FF\s]{2,20})',
-        # Mixed: Any text with time
-        r'(.{10,60}?)\s+(\d{1,2}:\d{2})\s*(?:-|\|)?\s*(.{0,30})',
-    ]
-    
-    for pattern in match_patterns:
-        found = re.findall(pattern, text)
-        for groups in found:
-            match_info = {
-                'teams': ' vs '.join(groups[:2]) if len(groups) >= 2 else groups[0],
-                'time': groups[-1] if ':' in str(groups[-1]) else None,
-                'raw': str(groups),
-                'source_type': 'text_pattern'
-            }
-            if len(str(groups)) > 15:  # Filter out noise
-                matches.append(match_info)
-    
-    # Pattern 4: Look for channel links that might indicate matches
-    channel_patterns = re.findall(
-        r'<a[^>]*href=[\"\']([^\"\']*)[\"\'][^>]*>([^<<]*(?:beIN|بي\s*إن|bein|Abu\s*Dhabi|أبو\s*ظبي|SSC|KSA|ON\s*Sport)[^<<]*)</a>',
-        html, re.IGNORECASE
-    )
-    
-    for href, channel_name in channel_patterns:
-        matches.append({
-            'channel': channel_name.strip(),
-            'channel_url': href,
-            'source_type': 'channel_link'
-        })
-    
+
+    # Pattern 2: If no AY_Match found, try alternative patterns
+    if not matches:
+        alt_patterns = [
+            r'<div[^>]*data-match[^>]*>(.*?)</div>',
+            r'<(?:div|span|td)[^>]*class=["\'][^"\']*(?:team|teamname|name|فريق)[^"\']*["\'][^>]*>(.*?)</(?:div|span|td)>',
+        ]
+        for pattern in alt_patterns:
+            containers = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
+            for content in containers:
+                match_info = parse_generic_match(content, source_name)
+                if match_info:
+                    matches.append(match_info)
+
+    # Pattern 3: Extract from text using structured patterns
+    if not matches:
+        matches = extract_from_text_patterns(html, source_name)
+
     return matches
 
-def parse_match_container(content, class_name=""):
-    """Parse a single match container (div/li/article)"""
-    if not content or len(content) < 20:
+def parse_ay_match_container(content, class_name, source_name):
+    """Parse an AY_Match container"""
+    if not content or len(content) < 10:
         return None
-    
+
     info = {
-        'container_class': class_name,
-        'source_type': 'html_container'
+        'source': source_name,
+        'source_type': 'AY_Match',
+        'status_class': class_name,
     }
-    
+
+    # Determine match status from class name
+    class_lower = class_name.lower()
+    if 'live' in class_lower:
+        info['status'] = 'live'
+    elif 'comming-soon' in class_lower or 'coming-soon' in class_lower:
+        info['status'] = 'upcoming'
+    elif 'not-started' in class_lower:
+        info['status'] = 'not_started'
+    elif 'finished' in class_lower:
+        info['status'] = 'finished'
+    else:
+        info['status'] = 'unknown'
+
+    # Extract team names from alt attributes
+    alt_teams = re.findall(r'alt=["\']([^"\']{2,30})["\']', content)
+    if len(alt_teams) >= 2:
+        info['home_team'] = alt_teams[0]
+        info['away_team'] = alt_teams[1]
+        info['teams'] = f"{alt_teams[0]} vs {alt_teams[1]}"
+
+    # Extract team names from title attributes
+    if 'teams' not in info:
+        title_teams = re.findall(r'title=["\']([^"\']{2,30})["\']', content)
+        if len(title_teams) >= 2:
+            info['home_team'] = title_teams[0]
+            info['away_team'] = title_teams[1]
+            info['teams'] = f"{title_teams[0]} vs {title_teams[1]}"
+
+    # Extract team names from specific class elements
+    if 'teams' not in info:
+        team_elements = re.findall(
+            r'<(?:span|div|td|a)[^>]*class=["\'][^"\']*(?:team|teamname|name|فريق)[^"\']*["\'][^>]*>(.*?)</(?:span|div|td|a)>',
+            content, re.DOTALL | re.IGNORECASE
+        )
+        if len(team_elements) >= 2:
+            teams = []
+            for t in team_elements:
+                clean = re.sub(r'<[^>]+>', '', t).strip()
+                if clean and len(clean) > 1:
+                    teams.append(clean)
+            if len(teams) >= 2:
+                info['home_team'] = teams[0]
+                info['away_team'] = teams[1]
+                info['teams'] = f"{teams[0]} vs {teams[1]}"
+
     # Extract time
     time_match = re.search(r'(\d{1,2}:\d{2})', content)
     if time_match:
         info['time'] = time_match.group(1)
-    
-    # Extract team names from alt attributes, title attributes, or text
-    team_patterns = [
-        r'alt=[\"\']([^\"\']{2,30})[\"\'"]',
-        r'title=[\"\']([^\"\']{2,30})[\"\'"]',
-        r'>([^<<]{2,25}(?:vs|ضد|VS)[^<<]{2,25})<<',
-    ]
-    
-    for pattern in team_patterns:
-        team_match = re.search(pattern, content, re.IGNORECASE)
-        if team_match:
-            info['teams'] = team_match.group(1).strip()
-            break
-    
-    # Extract channel
-    channel_keywords = ['beIN', 'بي إن', 'bein', 'Abu Dhabi', 'أبو ظبي', 'SSC', 'KSA', 'ON Sport', 'Dubai', 'دبي']
+
+    # Extract score
+    score_match = re.search(r'(\d+\s*[-]\s*\d+)', content)
+    if score_match:
+        info['score'] = score_match.group(1)
+
+    # Extract channel info
+    channel_keywords = ['beIN', 'بي إن', 'bein', 'Abu Dhabi', 'أبو ظبي', 'SSC', 'KSA', 'ON Sport', 'STC', 'دبي', 'Dubai']
+    content_lower = content.lower()
     for kw in channel_keywords:
-        if kw.lower() in content.lower():
+        if kw.lower() in content_lower:
             info['channel'] = kw
             break
-    
+
     # Extract links
-    links = re.findall(r'href=[\"\']([^\"\']*)[\"\'"]', content)
+    links = re.findall(r'href=["\']([^"\']*)["\']', content)
     if links:
         info['links'] = links
-    
+
     # Only return if we found meaningful data
-    if 'teams' in info or 'time' in info or 'channel' in info:
+    if 'teams' in info or 'home_team' in info:
         return info
-    
+
     return None
+
+def parse_generic_match(content, source_name):
+    """Parse generic match container"""
+    if not content:
+        return None
+
+    info = {
+        'source': source_name,
+        'source_type': 'generic',
+    }
+
+    text = re.sub(r'<[^>]+>', ' ', content)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    if len(text) < 5:
+        return None
+
+    time_match = re.search(r'(\d{1,2}:\d{2})', text)
+    if time_match:
+        info['time'] = time_match.group(1)
+
+    score_match = re.search(r'(\d+\s*[-]\s*\d+)', text)
+    if score_match:
+        info['score'] = score_match.group(1)
+
+    info['raw_text'] = text[:100]
+
+    return info if len(text) > 10 else None
+
+def extract_from_text_patterns(html, source_name):
+    """Extract matches from text using known patterns"""
+    matches = []
+
+    clean_html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    clean_html = re.sub(r'<style[^>]*>.*?</style>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
+
+    text = re.sub(r'<[^>]+>', ' ', clean_html)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    lines = text.split('.')
+
+    for line in lines:
+        line = line.strip()
+        if len(line) < 15 or len(line) > 200:
+            continue
+
+        time_match = re.search(r'(\d{1,2}:\d{2})', line)
+        if not time_match:
+            continue
+
+        has_score = re.search(r'\d+\s*[-]\s*\d+', line)
+        has_status = any(kw in line for kw in ['لم تبدأ', 'جارية', 'بعد قليل', 'مباشر', 'انتهت', 'live', 'finished'])
+
+        if has_score or has_status:
+            clean_line = line
+            noise_words = ['مباريات', 'الأمس', 'اليوم', 'الغد', 'مباراة', 'بث مباشر', 'يلا شوت', 'koora', 'live']
+            for word in noise_words:
+                clean_line = clean_line.replace(word, '')
+
+            matches.append({
+                'source': source_name,
+                'source_type': 'text_pattern',
+                'time': time_match.group(1),
+                'raw': line[:150],
+                'cleaned': clean_line[:150],
+            })
+
+    return matches
 
 def get_thesportsdb_matches():
     """Fallback: Get matches from TheSportsDB"""
     matches = []
-    league_ids = [4328, 4335, 4331, 4332, 4334, 4337]  # Major leagues + UCL
-    
+    league_ids = [4328, 4335, 4331, 4332, 4334, 4337]
+
     for lid in league_ids:
         try:
             data = fetch_url(f"https://www.thesportsdb.com/api/v1/json/3/eventsnextleague.php?id={lid}", use_cache=True)
@@ -232,11 +258,10 @@ def get_thesportsdb_matches():
                         'timestamp': event.get('strTimestamp'),
                         'channel': event.get('strChannel', 'Unknown'),
                         'source': 'thesportsdb',
-                        'has_bein': 'bein' in str(event.get('strChannel', '')).lower()
                     })
         except Exception as e:
             logging.error(f"TheSportsDB error: {e}")
-    
+
     return matches
 
 # ========== ROUTES ==========
@@ -271,46 +296,22 @@ def get_today_matches():
     """Get today's matches from all sources"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_matches = []
-    
-    # Try Arabic sources
+
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
-            # Try JSON extraction first (for JS-rendered sites)
-            json_data = extract_json_from_html(html)
-            for data in json_data:
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            item['source'] = name
-                            item['source_type'] = 'json_embedded'
-                            all_matches.append(item)
-                elif isinstance(data, dict):
-                    # Look for matches/events/games keys
-                    for key in ['matches', 'events', 'games', 'fixtures']:
-                        if key in data and isinstance(data[key], list):
-                            for item in data[key]:
-                                if isinstance(item, dict):
-                                    item['source'] = name
-                                    item['source_type'] = 'json_embedded'
-                                    all_matches.append(item)
-            
-            # Try HTML extraction
-            html_matches = extract_matches_from_html(html)
-            for m in html_matches:
-                m['source'] = name
-                all_matches.append(m)
-    
-    # Fallback to TheSportsDB
+            matches = extract_matches_from_html_v2(html, name)
+            all_matches.extend(matches)
+
     if not all_matches:
         db_matches = get_thesportsdb_matches()
         for m in db_matches:
             if m.get('date') == today:
                 all_matches.append(m)
-    
+
     if not all_matches:
         all_matches = get_thesportsdb_matches()[:20]
-    
+
     return jsonify({
         "date": today,
         "matches": all_matches,
@@ -321,15 +322,15 @@ def get_today_matches():
 def get_tomorrow_matches():
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
     all_matches = []
-    
+
     db_matches = get_thesportsdb_matches()
     for m in db_matches:
         if m.get('date') == tomorrow:
             all_matches.append(m)
-    
+
     if not all_matches:
         all_matches = db_matches[:10]
-    
+
     return jsonify({
         "date": tomorrow,
         "matches": all_matches,
@@ -339,20 +340,16 @@ def get_tomorrow_matches():
 @app.route('/matches/live')
 def get_live_matches():
     all_matches = []
-    
+
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=False)
         if html:
-            live_keywords = ['مباشر', 'live', 'بث', 'جارية', 'now', ' LIVE ', 'بث مباشر']
-            is_live = any(kw in html for kw in live_keywords)
-            
-            if is_live:
-                matches = extract_matches_from_html(html)
-                for m in matches:
-                    m['source'] = name
+            matches = extract_matches_from_html_v2(html, name)
+            for m in matches:
+                if m.get('status') == 'live':
                     m['is_live'] = True
                     all_matches.append(m)
-    
+
     return jsonify({
         "matches": all_matches,
         "count": len(all_matches)
@@ -361,23 +358,16 @@ def get_live_matches():
 @app.route('/channels/bein')
 def get_bein_matches():
     all_matches = []
-    
+
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
-            matches = extract_matches_from_html(html)
+            matches = extract_matches_from_html_v2(html, name)
             for m in matches:
                 if m.get('channel') or 'bein' in str(m).lower() or 'بي إن' in str(m):
-                    m['source'] = name
                     m['channel'] = m.get('channel', 'Bein Sports')
                     all_matches.append(m)
-    
-    # Also check TheSportsDB
-    db_matches = get_thesportsdb_matches()
-    for m in db_matches:
-        if m.get('has_bein'):
-            all_matches.append(m)
-    
+
     return jsonify({
         "channel": "Bein Sports",
         "matches": all_matches,
@@ -390,46 +380,30 @@ def scrape_source(source_name):
     url = ARABIC_SOURCES.get(source_name)
     if not url:
         return jsonify({"error": f"Unknown source: {source_name}"}), 404
-    
+
     html = fetch_url(url, use_cache=False)
     if not html:
         return jsonify({"error": "Failed to fetch source"}), 500
-    
-    # Extract title
-    title_match = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
-    title = title_match.group(1) if title_match else "No title"
-    
-    # Extract JSON data
-    json_data = extract_json_from_html(html)
-    
-    # Extract matches via HTML
-    html_matches = extract_matches_from_html(html)
-    
-    # Extract all links
-    all_links = re.findall(r'href=[\"\']([^\"\']*)[\"\'"]', html)
-    channel_links = [l for l in all_links if any(kw in l.lower() for kw in ['bein', 'abu', 'ssc', 'sport', 'live', 'channel'])]
-    
-    # Look for API endpoints
-    api_patterns = re.findall(r'[\"\']([^\"\']*api[^\"\']*)[\"\'"]', html, re.IGNORECASE)
-    
-    # Extract text preview
-    clean_html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    clean_html = re.sub(r'<style[^>]*>.*?</style>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', ' ', clean_html)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
+
+    matches = extract_matches_from_html_v2(html, source_name)
+
+    raw_containers = re.findall(
+        r'<[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>(.*?)</(?:div|li|article)>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+
     return jsonify({
         "source": source_name,
         "url": url,
-        "title": title,
+        "title": re.search(r'<title>(.*?)</title>', html, re.IGNORECASE).group(1) if re.search(r'<title>(.*?)</title>', html, re.IGNORECASE) else "No title",
         "content_length": len(html),
-        "json_objects_found": len(json_data),
-        "json_previews": [str(d)[:200] for d in json_data[:3]],
-        "html_matches_found": len(html_matches),
-        "html_matches": html_matches[:10],
-        "channel_links": channel_links[:20],
-        "api_endpoints_found": list(set(api_patterns))[:10],
-        "text_preview": text[:800]
+        "matches_found": len(matches),
+        "matches": matches[:20],
+        "raw_container_count": len(raw_containers),
+        "sample_raw_containers": [{
+            "class": c[0],
+            "content_preview": c[1][:200]
+        } for c in raw_containers[:5]]
     })
 
 @app.route('/scrape/all')
@@ -439,18 +413,16 @@ def scrape_all_sources():
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
-            json_data = extract_json_from_html(html)
-            html_matches = extract_matches_from_html(html)
+            matches = extract_matches_from_html_v2(html, name)
             results[name] = {
                 "status": "ok",
                 "content_length": len(html),
-                "json_found": len(json_data),
-                "matches_found": len(html_matches),
+                "matches_found": len(matches),
                 "title": re.search(r'<title>(.*?)</title>', html, re.IGNORECASE).group(1) if re.search(r'<title>(.*?)</title>', html, re.IGNORECASE) else "No title"
             }
         else:
             results[name] = {"status": "failed", "error": "Could not fetch"}
-    
+
     return jsonify(results)
 
 @app.route('/sources')
