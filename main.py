@@ -17,6 +17,15 @@ ARABIC_SOURCES = {
     "livekoora": "https://livekoora.info/",
 }
 
+# Known stream domain patterns
+STREAM_DOMAINS = [
+    'drix.online', 'top.drix.online', 'live.drix.online',
+    'yalla-shoots.com', 'yalla-shoot.com', 'yallashoot.com',
+    'koora-live.tv', 'koora-live.com', 'koora.tv',
+    'beinmatch', 'bein-match', 'beinsports',
+    'livestream', 'stream', 'player', 'embed',
+]
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -46,18 +55,25 @@ def fetch_url(url, headers=None, timeout=20, use_cache=True):
         logging.error(f"Fetch failed for {url}: {e}")
         return None
 
+def is_stream_url(url):
+    """Check if a URL is likely a stream URL"""
+    url_lower = url.lower()
+    for domain in STREAM_DOMAINS:
+        if domain in url_lower:
+            return True
+    # Also check for common stream patterns
+    if any(ext in url_lower for ext in ['.m3u8', '.mp4', '.ts', 'stream', 'live', 'play', 'embed']):
+        return True
+    return False
+
 def extract_ay_match_containers(html):
     """Extract AY_Match containers by finding start tags and matching end tags"""
     containers = []
 
-    # Find all AY_Match start positions
     start_pattern = r'<div[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>'
 
     for match in re.finditer(start_pattern, html, re.IGNORECASE):
         class_name = match.group(1)
-        start_pos = match.start()
-
-        # Find matching </div> by counting nested divs
         pos = match.end()
         depth = 1
         while pos < len(html) and depth > 0:
@@ -96,7 +112,7 @@ def extract_matches_from_html(html, source_name):
     return matches
 
 def parse_ay_match_container(content, class_name, source_name):
-    """Parse an AY_Match container based on actual HTML structure"""
+    """Parse an AY_Match container"""
     if not content or len(content) < 20:
         return None
 
@@ -106,7 +122,7 @@ def parse_ay_match_container(content, class_name, source_name):
         'status_class': class_name,
     }
 
-    # Determine match status from class name
+    # Determine match status
     class_lower = class_name.lower()
     if 'live' in class_lower:
         info['status'] = 'live'
@@ -120,7 +136,6 @@ def parse_ay_match_container(content, class_name, source_name):
         info['status'] = 'unknown'
 
     # Extract team names from alt attributes in TM1 and TM2
-    # Use single-quoted regex strings to avoid escaping issues
     home_team_match = re.search(
         r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
         content, re.DOTALL | re.IGNORECASE
@@ -136,7 +151,7 @@ def parse_ay_match_container(content, class_name, source_name):
     if away_team_match:
         info['away_team'] = away_team_match.group(1).strip()
 
-    # Fallback: find all img alt attributes in the container
+    # Fallback: find all img alt attributes
     if 'home_team' not in info or 'away_team' not in info:
         all_alts = re.findall(r'<img[^>]*alt=["\']([^"\']+)["\']', content)
         if len(all_alts) >= 2:
@@ -169,34 +184,53 @@ def parse_ay_match_container(content, class_name, source_name):
             info['channel'] = kw
             break
 
-    # Extract links
-    links = re.findall(r'href=["\']([^"\']*)["\']', content)
-    if links:
+    # Extract ALL links and categorize them
+    all_links = re.findall(r'href=["\']([^"\']*)["\']', content)
+    if all_links:
         absolute_links = []
-        for link in links:
+        stream_links = []
+        match_page_links = []
+
+        for link in all_links:
+            # Make absolute
             if link.startswith('http'):
-                absolute_links.append(link)
+                abs_link = link
             elif link.startswith('/'):
                 if source_name == 'shoofelmatch':
-                    absolute_links.append(f"https://www.shoofelmatch.com{link}")
+                    abs_link = f"https://www.shoofelmatch.com{link}"
                 elif source_name == 'koora_online':
-                    absolute_links.append(f"https://koora-online.tv{link}")
+                    abs_link = f"https://koora-online.tv{link}"
                 elif source_name == 'xkoora':
-                    absolute_links.append(f"https://www.xkoora.net{link}")
+                    abs_link = f"https://www.xkoora.net{link}"
                 elif source_name == 'livekoora':
-                    absolute_links.append(f"https://livekoora.info{link}")
+                    abs_link = f"https://livekoora.info{link}"
                 else:
-                    absolute_links.append(link)
-        info['links'] = absolute_links
+                    abs_link = link
+            else:
+                abs_link = link
 
-    # Extract league/tournament info
+            absolute_links.append(abs_link)
+
+            # Categorize
+            if is_stream_url(abs_link):
+                stream_links.append(abs_link)
+            else:
+                match_page_links.append(abs_link)
+
+        info['all_links'] = absolute_links
+        if stream_links:
+            info['stream_links'] = stream_links
+            info['stream_url'] = stream_links[0]  # Primary stream URL
+        if match_page_links:
+            info['match_links'] = match_page_links
+
+    # Extract league info
     league_match = re.search(r'<div[^>]*class=["\'][^"\']*(?:league|tournament|championship|دوري)[^"\']*["\'][^>]*>(.*?)</div>', content, re.DOTALL | re.IGNORECASE)
     if league_match:
         league_text = re.sub(r'<[^>]+>', '', league_match.group(1)).strip()
         if league_text:
             info['league'] = league_text
 
-    # Only return if we found at least a team name
     if 'home_team' in info:
         return info
 
@@ -236,7 +270,7 @@ def get_thesportsdb_matches():
 def index():
     return jsonify({
         "status": "online",
-        "message": "Arabic Sports API running",
+        "message": "Arabic Sports API with stream links",
         "sources": list(ARABIC_SOURCES.keys()) + ["thesportsdb"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
@@ -259,7 +293,7 @@ def health():
 
 @app.route('/matches/today')
 def get_today_matches():
-    """Get today's matches from all sources"""
+    """Get today's matches with stream links"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_matches = []
 
@@ -269,7 +303,6 @@ def get_today_matches():
             matches = extract_matches_from_html(html, name)
             all_matches.extend(matches)
 
-    # Fallback to TheSportsDB if no Arabic matches
     if not all_matches:
         db_matches = get_thesportsdb_matches()
         for m in db_matches:
@@ -285,27 +318,9 @@ def get_today_matches():
         "count": len(all_matches)
     })
 
-@app.route('/matches/tomorrow')
-def get_tomorrow_matches():
-    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
-    all_matches = []
-
-    db_matches = get_thesportsdb_matches()
-    for m in db_matches:
-        if m.get('date') == tomorrow:
-            all_matches.append(m)
-
-    if not all_matches:
-        all_matches = db_matches[:10]
-
-    return jsonify({
-        "date": tomorrow,
-        "matches": all_matches,
-        "count": len(all_matches)
-    })
-
 @app.route('/matches/live')
 def get_live_matches():
+    """Get live matches with stream links"""
     all_matches = []
 
     for name, url in ARABIC_SOURCES.items():
@@ -320,6 +335,37 @@ def get_live_matches():
     return jsonify({
         "matches": all_matches,
         "count": len(all_matches)
+    })
+
+@app.route('/streams')
+def get_all_streams():
+    """Get all matches that have stream URLs"""
+    all_matches = []
+
+    for name, url in ARABIC_SOURCES.items():
+        html = fetch_url(url, use_cache=True)
+        if html:
+            matches = extract_matches_from_html(html, name)
+            for m in matches:
+                if m.get('stream_url'):
+                    all_matches.append(m)
+
+    return jsonify({
+        "matches_with_streams": all_matches,
+        "count": len(all_matches)
+    })
+
+@app.route('/stream/<path:url>')
+def get_stream_details(url):
+    """Get details about a specific stream URL"""
+    # Decode URL if encoded
+    from urllib.parse import unquote
+    decoded_url = unquote(url)
+
+    return jsonify({
+        "stream_url": decoded_url,
+        "is_stream": is_stream_url(decoded_url),
+        "note": "This is a direct stream link. You may need to set proper Referer headers to access it."
     })
 
 @app.route('/channels/bein')
@@ -355,18 +401,18 @@ def scrape_source(source_name):
     matches = extract_matches_from_html(html, source_name)
     containers = extract_ay_match_containers(html)
 
+    # Count streams
+    stream_count = sum(1 for m in matches if m.get('stream_url'))
+
     return jsonify({
         "source": source_name,
         "url": url,
         "title": re.search(r'<title>(.*?)</title>', html, re.IGNORECASE).group(1) if re.search(r'<title>(.*?)</title>', html, re.IGNORECASE) else "No title",
         "content_length": len(html),
         "matches_found": len(matches),
-        "matches": matches[:20],
+        "matches_with_streams": stream_count,
+        "matches": matches[:10],
         "raw_container_count": len(containers),
-        "sample_raw_containers": [{
-            "class": c[0],
-            "content_preview": c[1][:300]
-        } for c in containers[:3]]
     })
 
 @app.route('/scrape/all')
@@ -377,10 +423,12 @@ def scrape_all_sources():
         html = fetch_url(url, use_cache=True)
         if html:
             matches = extract_matches_from_html(html, name)
+            stream_count = sum(1 for m in matches if m.get('stream_url'))
             results[name] = {
                 "status": "ok",
                 "content_length": len(html),
                 "matches_found": len(matches),
+                "streams_found": stream_count,
                 "title": re.search(r'<title>(.*?)</title>', html, re.IGNORECASE).group(1) if re.search(r'<title>(.*?)</title>', html, re.IGNORECASE) else "No title"
             }
         else:
@@ -435,7 +483,7 @@ def get_channels(cat_id):
 def get_stream(channel_id):
     return jsonify({
         "error": "Stream URLs unavailable",
-        "message": "The old API is offline. Use /matches/today or /matches/live for match listings.",
+        "message": "The old API is offline. Use /matches/today or /streams for match listings with stream links.",
         "channel_id": channel_id
     }), 503
 
