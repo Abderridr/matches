@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone, timedelta
 import time
 import logging
+from urllib.parse import unquote, urljoin
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +25,7 @@ STREAM_DOMAINS = [
     'koora-live.tv', 'koora-live.com', 'koora.tv',
     'beinmatch', 'bein-match', 'beinsports',
     'livestream', 'stream', 'player', 'embed',
+    'livekooracom', 'koora-online.mov', 'koray.live',
 ]
 
 HEADERS = {
@@ -61,15 +63,105 @@ def is_stream_url(url):
     for domain in STREAM_DOMAINS:
         if domain in url_lower:
             return True
-    # Also check for common stream patterns
     if any(ext in url_lower for ext in ['.m3u8', '.mp4', '.ts', 'stream', 'live', 'play', 'embed']):
         return True
     return False
 
+def extract_deep_stream_url(stream_page_url, referer=None):
+    """Follow a stream page to extract the actual video URL"""
+    headers = dict(HEADERS)
+    if referer:
+        headers['Referer'] = referer
+
+    html = fetch_url(stream_page_url, headers=headers, use_cache=False)
+    if not html:
+        return None
+
+    stream_info = {
+        'source_page': stream_page_url,
+        'found_urls': []
+    }
+
+    # Pattern 1: Look for iframe src (most common)
+    iframe_match = re.search(r'<iframe[^>]*src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if iframe_match:
+        iframe_url = iframe_match.group(1)
+        if iframe_url.startswith('//'):
+            iframe_url = 'https:' + iframe_url
+        elif iframe_url.startswith('/'):
+            iframe_url = urljoin(stream_page_url, iframe_url)
+        stream_info['iframe_url'] = iframe_url
+        stream_info['found_urls'].append(iframe_url)
+
+    # Pattern 2: Look for video source
+    video_match = re.search(r'<video[^>]*src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if video_match:
+        stream_info['video_url'] = video_match.group(1)
+        stream_info['found_urls'].append(video_match.group(1))
+
+    # Pattern 3: Look for .m3u8 URLs
+    m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
+    if m3u8_matches:
+        stream_info['m3u8_urls'] = m3u8_matches
+        stream_info['found_urls'].extend(m3u8_matches)
+
+    # Pattern 4: Look for .mp4 URLs
+    mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
+    if mp4_matches:
+        stream_info['mp4_urls'] = mp4_matches
+        stream_info['found_urls'].extend(mp4_matches)
+
+    # Pattern 5: Look for stream URLs in JavaScript
+    js_stream_patterns = [
+        r'src\s*:\s*["\']([^"\']+)["\']',
+        r'url\s*:\s*["\']([^"\']+)["\']',
+        r'file\s*:\s*["\']([^"\']+)["\']',
+        r'["\']([^"\']*\.m3u8[^"\']*)["\']',
+    ]
+    for pattern in js_stream_patterns:
+        matches = re.findall(pattern, html)
+        for m in matches:
+            if 'http' in m or '.m3u8' in m or '.mp4' in m:
+                if m not in stream_info['found_urls']:
+                    stream_info['found_urls'].append(m)
+
+    # Pattern 6: Look for jwplayer or videojs config
+    player_match = re.search(r'(?:jwplayer|player)\s*\(\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if player_match:
+        stream_info['player_id'] = player_match.group(1)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_urls = []
+    for url in stream_info['found_urls']:
+        if url not in seen and len(url) > 10:
+            seen.add(url)
+            unique_urls.append(url)
+    stream_info['found_urls'] = unique_urls
+
+    # Determine best stream URL
+    if stream_info['found_urls']:
+        # Prefer m3u8, then mp4, then iframe, then others
+        for url in stream_info['found_urls']:
+            if '.m3u8' in url:
+                stream_info['best_url'] = url
+                stream_info['stream_type'] = 'hls'
+                break
+        else:
+            for url in stream_info['found_urls']:
+                if '.mp4' in url:
+                    stream_info['best_url'] = url
+                    stream_info['stream_type'] = 'mp4'
+                    break
+            else:
+                stream_info['best_url'] = stream_info['found_urls'][0]
+                stream_info['stream_type'] = 'unknown'
+
+    return stream_info
+
 def extract_ay_match_containers(html):
     """Extract AY_Match containers by finding start tags and matching end tags"""
     containers = []
-
     start_pattern = r'<div[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>'
 
     for match in re.finditer(start_pattern, html, re.IGNORECASE):
@@ -135,7 +227,7 @@ def parse_ay_match_container(content, class_name, source_name):
     else:
         info['status'] = 'unknown'
 
-    # Extract team names from alt attributes in TM1 and TM2
+    # Extract team names
     home_team_match = re.search(
         r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
         content, re.DOTALL | re.IGNORECASE
@@ -147,7 +239,6 @@ def parse_ay_match_container(content, class_name, source_name):
 
     if home_team_match:
         info['home_team'] = home_team_match.group(1).strip()
-
     if away_team_match:
         info['away_team'] = away_team_match.group(1).strip()
 
@@ -184,7 +275,7 @@ def parse_ay_match_container(content, class_name, source_name):
             info['channel'] = kw
             break
 
-    # Extract ALL links and categorize them
+    # Extract and categorize links
     all_links = re.findall(r'href=["\']([^"\']*)["\']', content)
     if all_links:
         absolute_links = []
@@ -192,26 +283,16 @@ def parse_ay_match_container(content, class_name, source_name):
         match_page_links = []
 
         for link in all_links:
-            # Make absolute
             if link.startswith('http'):
                 abs_link = link
             elif link.startswith('/'):
-                if source_name == 'shoofelmatch':
-                    abs_link = f"https://www.shoofelmatch.com{link}"
-                elif source_name == 'koora_online':
-                    abs_link = f"https://koora-online.tv{link}"
-                elif source_name == 'xkoora':
-                    abs_link = f"https://www.xkoora.net{link}"
-                elif source_name == 'livekoora':
-                    abs_link = f"https://livekoora.info{link}"
-                else:
-                    abs_link = link
+                base = ARABIC_SOURCES.get(source_name, '')
+                abs_link = urljoin(base, link)
             else:
                 abs_link = link
 
             absolute_links.append(abs_link)
 
-            # Categorize
             if is_stream_url(abs_link):
                 stream_links.append(abs_link)
             else:
@@ -220,7 +301,7 @@ def parse_ay_match_container(content, class_name, source_name):
         info['all_links'] = absolute_links
         if stream_links:
             info['stream_links'] = stream_links
-            info['stream_url'] = stream_links[0]  # Primary stream URL
+            info['stream_url'] = stream_links[0]
         if match_page_links:
             info['match_links'] = match_page_links
 
@@ -270,7 +351,7 @@ def get_thesportsdb_matches():
 def index():
     return jsonify({
         "status": "online",
-        "message": "Arabic Sports API with stream links",
+        "message": "Arabic Sports API with deep stream extraction",
         "sources": list(ARABIC_SOURCES.keys()) + ["thesportsdb"],
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
@@ -355,18 +436,23 @@ def get_all_streams():
         "count": len(all_matches)
     })
 
-@app.route('/stream/<path:url>')
-def get_stream_details(url):
-    """Get details about a specific stream URL"""
-    # Decode URL if encoded
-    from urllib.parse import unquote
+@app.route('/stream/deep/<path:url>')
+def get_deep_stream(url):
+    """Deep extraction: follow a stream page to get actual video URL"""
     decoded_url = unquote(url)
 
-    return jsonify({
-        "stream_url": decoded_url,
-        "is_stream": is_stream_url(decoded_url),
-        "note": "This is a direct stream link. You may need to set proper Referer headers to access it."
-    })
+    if not decoded_url.startswith('http'):
+        return jsonify({"error": "Invalid URL"}), 400
+
+    stream_info = extract_deep_stream_url(decoded_url)
+
+    if not stream_info:
+        return jsonify({
+            "error": "Could not extract stream",
+            "url": decoded_url
+        }), 500
+
+    return jsonify(stream_info)
 
 @app.route('/channels/bein')
 def get_bein_matches():
@@ -400,8 +486,6 @@ def scrape_source(source_name):
 
     matches = extract_matches_from_html(html, source_name)
     containers = extract_ay_match_containers(html)
-
-    # Count streams
     stream_count = sum(1 for m in matches if m.get('stream_url'))
 
     return jsonify({
@@ -480,10 +564,10 @@ def get_channels(cat_id):
     ])
 
 @app.route('/stream/<int:channel_id>')
-def get_stream(channel_id):
+def get_stream_legacy(channel_id):
     return jsonify({
         "error": "Stream URLs unavailable",
-        "message": "The old API is offline. Use /matches/today or /streams for match listings with stream links.",
+        "message": "Use /streams for matches with stream links, or /stream/deep/<url> to extract actual video URLs.",
         "channel_id": channel_id
     }), 503
 
@@ -504,7 +588,7 @@ def verify_stream(channel_id):
     return jsonify({
         "channel_id": channel_id,
         "status": "unavailable",
-        "message": "Old API is offline. Streams cannot be verified."
+        "message": "Old API is offline. Use /stream/deep/<url> to verify streams."
     })
 
 if __name__ == '__main__':
