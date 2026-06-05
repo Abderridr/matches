@@ -46,14 +46,14 @@ def fetch_url(url, headers=None, timeout=20, use_cache=True):
         logging.error(f"Fetch failed for {url}: {e}")
         return None
 
-def extract_matches_from_html_v2(html, source_name):
-    """Extract matches using specific AY_Match container patterns"""
+def extract_matches_from_html(html, source_name):
+    """Extract matches from AY_Match containers"""
     if not html:
         return []
 
     matches = []
 
-    # Pattern 1: Extract from AY_Match containers directly
+    # Extract full AY_Match containers
     match_containers = re.findall(
         r'<[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>(.*?)</(?:div|li|article)>',
         html, re.DOTALL | re.IGNORECASE
@@ -64,28 +64,11 @@ def extract_matches_from_html_v2(html, source_name):
         if match_info:
             matches.append(match_info)
 
-    # Pattern 2: If no AY_Match found, try alternative patterns
-    if not matches:
-        alt_patterns = [
-            r'<div[^>]*data-match[^>]*>(.*?)</div>',
-            r'<(?:div|span|td)[^>]*class=["\'][^"\']*(?:team|teamname|name|فريق)[^"\']*["\'][^>]*>(.*?)</(?:div|span|td)>',
-        ]
-        for pattern in alt_patterns:
-            containers = re.findall(pattern, html, re.DOTALL | re.IGNORECASE)
-            for content in containers:
-                match_info = parse_generic_match(content, source_name)
-                if match_info:
-                    matches.append(match_info)
-
-    # Pattern 3: Extract from text using structured patterns
-    if not matches:
-        matches = extract_from_text_patterns(html, source_name)
-
     return matches
 
 def parse_ay_match_container(content, class_name, source_name):
-    """Parse an AY_Match container"""
-    if not content or len(content) < 10:
+    """Parse an AY_Match container based on actual HTML structure"""
+    if not content or len(content) < 20:
         return None
 
     info = {
@@ -107,134 +90,91 @@ def parse_ay_match_container(content, class_name, source_name):
     else:
         info['status'] = 'unknown'
 
-    # Extract team names from alt attributes
-    alt_teams = re.findall(r'alt=["\']([^"\']{2,30})["\']', content)
-    if len(alt_teams) >= 2:
-        info['home_team'] = alt_teams[0]
-        info['away_team'] = alt_teams[1]
-        info['teams'] = f"{alt_teams[0]} vs {alt_teams[1]}"
+    # Extract team names from alt attributes in TM1 and TM2
+    # Home team: <div class='MT_Team TM1'>...<img alt="TeamName"...
+    # Away team: <div class='MT_Team TM2'>...<img alt="TeamName"...
 
-    # Extract team names from title attributes
-    if 'teams' not in info:
-        title_teams = re.findall(r'title=["\']([^"\']{2,30})["\']', content)
-        if len(title_teams) >= 2:
-            info['home_team'] = title_teams[0]
-            info['away_team'] = title_teams[1]
-            info['teams'] = f"{title_teams[0]} vs {title_teams[1]}"
+    home_team_match = re.search(
+        r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
+        content, re.DOTALL | re.IGNORECASE
+    )
+    away_team_match = re.search(
+        r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM2[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
+        content, re.DOTALL | re.IGNORECASE
+    )
 
-    # Extract team names from specific class elements
-    if 'teams' not in info:
-        team_elements = re.findall(
-            r'<(?:span|div|td|a)[^>]*class=["\'][^"\']*(?:team|teamname|name|فريق)[^"\']*["\'][^>]*>(.*?)</(?:span|div|td|a)>',
-            content, re.DOTALL | re.IGNORECASE
-        )
-        if len(team_elements) >= 2:
-            teams = []
-            for t in team_elements:
-                clean = re.sub(r'<[^>]+>', '', t).strip()
-                if clean and len(clean) > 1:
-                    teams.append(clean)
-            if len(teams) >= 2:
-                info['home_team'] = teams[0]
-                info['away_team'] = teams[1]
-                info['teams'] = f"{teams[0]} vs {teams[1]}"
+    if home_team_match:
+        info['home_team'] = home_team_match.group(1).strip()
 
-    # Extract time
+    if away_team_match:
+        info['away_team'] = away_team_match.group(1).strip()
+
+    # If TM1/TM2 not found, try generic img alt within the container
+    if 'home_team' not in info or 'away_team' not in info:
+        all_alts = re.findall(r'<img[^>]*alt=["\']([^"\']+)["\']', content)
+        if len(all_alts) >= 2:
+            info['home_team'] = all_alts[0].strip()
+            info['away_team'] = all_alts[1].strip()
+        elif len(all_alts) == 1:
+            info['home_team'] = all_alts[0].strip()
+
+    # Build teams string
+    if 'home_team' in info and 'away_team' in info:
+        info['teams'] = f"{info['home_team']} vs {info['away_team']}"
+    elif 'home_team' in info:
+        info['teams'] = info['home_team']
+
+    # Extract time - look for time elements or HH:MM patterns
     time_match = re.search(r'(\d{1,2}:\d{2})', content)
     if time_match:
         info['time'] = time_match.group(1)
 
-    # Extract score
+    # Extract score - look for score patterns like "0 - 0" or "2-1"
     score_match = re.search(r'(\d+\s*[-]\s*\d+)', content)
     if score_match:
         info['score'] = score_match.group(1)
 
     # Extract channel info
-    channel_keywords = ['beIN', 'بي إن', 'bein', 'Abu Dhabi', 'أبو ظبي', 'SSC', 'KSA', 'ON Sport', 'STC', 'دبي', 'Dubai']
+    channel_keywords = ['beIN', 'بي إن', 'bein', 'Abu Dhabi', 'أبو ظبي', 'SSC', 'KSA', 'ON Sport', 'STC', 'دبي', 'Dubai', 'Saudi', 'السعودية']
     content_lower = content.lower()
     for kw in channel_keywords:
         if kw.lower() in content_lower:
             info['channel'] = kw
             break
 
-    # Extract links
+    # Extract links - look for hrefs within the container
     links = re.findall(r'href=["\']([^"\']*)["\']', content)
     if links:
-        info['links'] = links
+        # Make relative URLs absolute
+        absolute_links = []
+        for link in links:
+            if link.startswith('http'):
+                absolute_links.append(link)
+            elif link.startswith('/'):
+                if source_name == 'shoofelmatch':
+                    absolute_links.append(f"https://www.shoofelmatch.com{link}")
+                elif source_name == 'koora_online':
+                    absolute_links.append(f"https://koora-online.tv{link}")
+                elif source_name == 'xkoora':
+                    absolute_links.append(f"https://www.xkoora.net{link}")
+                elif source_name == 'livekoora':
+                    absolute_links.append(f"https://livekoora.info{link}")
+                else:
+                    absolute_links.append(link)
+        info['links'] = absolute_links
 
-    # Only return if we found meaningful data
-    if 'teams' in info or 'home_team' in info:
+    # Extract league/tournament info if available
+    league_match = re.search(r'<div[^>]*class=["\'][^"\']*(?:league|tournament|championship|دوري)[^"\']*["\'][^>]*>(.*?)</div>', content, re.DOTALL | re.IGNORECASE)
+    if league_match:
+        league_text = re.sub(r'<[^>]+>', '', league_match.group(1)).strip()
+        if league_text:
+            info['league'] = league_text
+
+    # Only return if we found at least a team name
+    if 'home_team' in info:
         return info
 
     return None
-
-def parse_generic_match(content, source_name):
-    """Parse generic match container"""
-    if not content:
-        return None
-
-    info = {
-        'source': source_name,
-        'source_type': 'generic',
-    }
-
-    text = re.sub(r'<[^>]+>', ' ', content)
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    if len(text) < 5:
-        return None
-
-    time_match = re.search(r'(\d{1,2}:\d{2})', text)
-    if time_match:
-        info['time'] = time_match.group(1)
-
-    score_match = re.search(r'(\d+\s*[-]\s*\d+)', text)
-    if score_match:
-        info['score'] = score_match.group(1)
-
-    info['raw_text'] = text[:100]
-
-    return info if len(text) > 10 else None
-
-def extract_from_text_patterns(html, source_name):
-    """Extract matches from text using known patterns"""
-    matches = []
-
-    clean_html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    clean_html = re.sub(r'<style[^>]*>.*?</style>', '', clean_html, flags=re.DOTALL | re.IGNORECASE)
-
-    text = re.sub(r'<[^>]+>', ' ', clean_html)
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    lines = text.split('.')
-
-    for line in lines:
-        line = line.strip()
-        if len(line) < 15 or len(line) > 200:
-            continue
-
-        time_match = re.search(r'(\d{1,2}:\d{2})', line)
-        if not time_match:
-            continue
-
-        has_score = re.search(r'\d+\s*[-]\s*\d+', line)
-        has_status = any(kw in line for kw in ['لم تبدأ', 'جارية', 'بعد قليل', 'مباشر', 'انتهت', 'live', 'finished'])
-
-        if has_score or has_status:
-            clean_line = line
-            noise_words = ['مباريات', 'الأمس', 'اليوم', 'الغد', 'مباراة', 'بث مباشر', 'يلا شوت', 'koora', 'live']
-            for word in noise_words:
-                clean_line = clean_line.replace(word, '')
-
-            matches.append({
-                'source': source_name,
-                'source_type': 'text_pattern',
-                'time': time_match.group(1),
-                'raw': line[:150],
-                'cleaned': clean_line[:150],
-            })
-
-    return matches
 
 def get_thesportsdb_matches():
     """Fallback: Get matches from TheSportsDB"""
@@ -300,9 +240,10 @@ def get_today_matches():
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
-            matches = extract_matches_from_html_v2(html, name)
+            matches = extract_matches_from_html(html, name)
             all_matches.extend(matches)
 
+    # Fallback to TheSportsDB if no Arabic matches
     if not all_matches:
         db_matches = get_thesportsdb_matches()
         for m in db_matches:
@@ -344,7 +285,7 @@ def get_live_matches():
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=False)
         if html:
-            matches = extract_matches_from_html_v2(html, name)
+            matches = extract_matches_from_html(html, name)
             for m in matches:
                 if m.get('status') == 'live':
                     m['is_live'] = True
@@ -362,7 +303,7 @@ def get_bein_matches():
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
-            matches = extract_matches_from_html_v2(html, name)
+            matches = extract_matches_from_html(html, name)
             for m in matches:
                 if m.get('channel') or 'bein' in str(m).lower() or 'بي إن' in str(m):
                     m['channel'] = m.get('channel', 'Bein Sports')
@@ -385,7 +326,7 @@ def scrape_source(source_name):
     if not html:
         return jsonify({"error": "Failed to fetch source"}), 500
 
-    matches = extract_matches_from_html_v2(html, source_name)
+    matches = extract_matches_from_html(html, source_name)
 
     raw_containers = re.findall(
         r'<[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>(.*?)</(?:div|li|article)>',
@@ -402,8 +343,8 @@ def scrape_source(source_name):
         "raw_container_count": len(raw_containers),
         "sample_raw_containers": [{
             "class": c[0],
-            "content_preview": c[1][:200]
-        } for c in raw_containers[:5]]
+            "content_preview": c[1][:300]
+        } for c in raw_containers[:3]]
     })
 
 @app.route('/scrape/all')
@@ -413,7 +354,7 @@ def scrape_all_sources():
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
-            matches = extract_matches_from_html_v2(html, name)
+            matches = extract_matches_from_html(html, name)
             results[name] = {
                 "status": "ok",
                 "content_length": len(html),
