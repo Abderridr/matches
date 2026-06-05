@@ -46,20 +46,49 @@ def fetch_url(url, headers=None, timeout=20, use_cache=True):
         logging.error(f"Fetch failed for {url}: {e}")
         return None
 
+def extract_ay_match_containers(html):
+    """Extract AY_Match containers by finding start tags and matching end tags"""
+    containers = []
+
+    # Find all AY_Match start positions
+    start_pattern = r'<div[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>'
+
+    for match in re.finditer(start_pattern, html, re.IGNORECASE):
+        class_name = match.group(1)
+        start_pos = match.start()
+
+        # Find matching </div> by counting nested divs
+        pos = match.end()
+        depth = 1
+        while pos < len(html) and depth > 0:
+            next_open = html.find('<div', pos)
+            next_close = html.find('</div>', pos)
+
+            if next_close == -1:
+                break
+
+            if next_open != -1 and next_open < next_close:
+                depth += 1
+                pos = next_open + 4
+            else:
+                depth -= 1
+                pos = next_close + 6
+
+        if depth == 0:
+            container_content = html[match.end():pos - 6]
+            containers.append((class_name, container_content))
+
+    return containers
+
 def extract_matches_from_html(html, source_name):
     """Extract matches from AY_Match containers"""
     if not html:
         return []
 
     matches = []
+    containers = extract_ay_match_containers(html)
 
-    # Extract full AY_Match containers
-    match_containers = re.findall(
-        r'<[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>(.*?)</(?:div|li|article)>',
-        html, re.DOTALL | re.IGNORECASE
-    )
-
-    for class_name, content in match_containers:
+    for class_name, content in containers:
         match_info = parse_ay_match_container(content, class_name, source_name)
         if match_info:
             matches.append(match_info)
@@ -92,14 +121,12 @@ def parse_ay_match_container(content, class_name, source_name):
 
     # Extract team names from alt attributes in TM1 and TM2
     # Home team: <div class='MT_Team TM1'>...<img alt="TeamName"...
-    # Away team: <div class='MT_Team TM2'>...<img alt="TeamName"...
-
     home_team_match = re.search(
-        r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
+        r"<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']",
         content, re.DOTALL | re.IGNORECASE
     )
     away_team_match = re.search(
-        r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM2[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
+        r"<div[^>]*class=["\'][^"\']*MT_Team\s+TM2[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']",
         content, re.DOTALL | re.IGNORECASE
     )
 
@@ -109,7 +136,7 @@ def parse_ay_match_container(content, class_name, source_name):
     if away_team_match:
         info['away_team'] = away_team_match.group(1).strip()
 
-    # If TM1/TM2 not found, try generic img alt within the container
+    # Fallback: find all img alt attributes in the container
     if 'home_team' not in info or 'away_team' not in info:
         all_alts = re.findall(r'<img[^>]*alt=["\']([^"\']+)["\']', content)
         if len(all_alts) >= 2:
@@ -124,12 +151,12 @@ def parse_ay_match_container(content, class_name, source_name):
     elif 'home_team' in info:
         info['teams'] = info['home_team']
 
-    # Extract time - look for time elements or HH:MM patterns
+    # Extract time
     time_match = re.search(r'(\d{1,2}:\d{2})', content)
     if time_match:
         info['time'] = time_match.group(1)
 
-    # Extract score - look for score patterns like "0 - 0" or "2-1"
+    # Extract score
     score_match = re.search(r'(\d+\s*[-]\s*\d+)', content)
     if score_match:
         info['score'] = score_match.group(1)
@@ -142,10 +169,9 @@ def parse_ay_match_container(content, class_name, source_name):
             info['channel'] = kw
             break
 
-    # Extract links - look for hrefs within the container
+    # Extract links
     links = re.findall(r'href=["\']([^"\']*)["\']', content)
     if links:
-        # Make relative URLs absolute
         absolute_links = []
         for link in links:
             if link.startswith('http'):
@@ -163,7 +189,7 @@ def parse_ay_match_container(content, class_name, source_name):
                     absolute_links.append(link)
         info['links'] = absolute_links
 
-    # Extract league/tournament info if available
+    # Extract league/tournament info
     league_match = re.search(r'<div[^>]*class=["\'][^"\']*(?:league|tournament|championship|دوري)[^"\']*["\'][^>]*>(.*?)</div>', content, re.DOTALL | re.IGNORECASE)
     if league_match:
         league_text = re.sub(r'<[^>]+>', '', league_match.group(1)).strip()
@@ -327,11 +353,7 @@ def scrape_source(source_name):
         return jsonify({"error": "Failed to fetch source"}), 500
 
     matches = extract_matches_from_html(html, source_name)
-
-    raw_containers = re.findall(
-        r'<[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>(.*?)</(?:div|li|article)>',
-        html, re.DOTALL | re.IGNORECASE
-    )
+    containers = extract_ay_match_containers(html)
 
     return jsonify({
         "source": source_name,
@@ -340,11 +362,11 @@ def scrape_source(source_name):
         "content_length": len(html),
         "matches_found": len(matches),
         "matches": matches[:20],
-        "raw_container_count": len(raw_containers),
+        "raw_container_count": len(containers),
         "sample_raw_containers": [{
             "class": c[0],
             "content_preview": c[1][:300]
-        } for c in raw_containers[:3]]
+        } for c in containers[:3]]
     })
 
 @app.route('/scrape/all')
