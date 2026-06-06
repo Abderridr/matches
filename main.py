@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone, timedelta
 import time
 import logging
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, quote
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -18,7 +18,6 @@ ARABIC_SOURCES = {
     "livekoora": "https://livekoora.info/",
 }
 
-# Known stream domain patterns
 STREAM_DOMAINS = [
     'drix.online', 'top.drix.online', 'live.drix.online',
     'yalla-shoots.com', 'yalla-shoot.com', 'yallashoot.com',
@@ -26,6 +25,7 @@ STREAM_DOMAINS = [
     'beinmatch', 'bein-match', 'beinsports',
     'livestream', 'stream', 'player', 'embed',
     'livekooracom', 'koora-online.mov', 'koray.live',
+    'gwoo.online', 'albaplayer',
 ]
 
 HEADERS = {
@@ -37,14 +37,15 @@ HEADERS = {
 
 cache = {}
 CACHE_TTL = 300
+DEEP_CACHE_TTL = 60  # Stream URLs expire quickly
 
 # ========== UTILITIES ==========
 
-def fetch_url(url, headers=None, timeout=20, use_cache=True):
+def fetch_url(url, headers=None, timeout=20, use_cache=True, cache_ttl=CACHE_TTL):
     now = time.time()
     cache_key = url
 
-    if use_cache and cache_key in cache and now - cache[cache_key]['time'] < CACHE_TTL:
+    if use_cache and cache_key in cache and now - cache[cache_key]['time'] < cache_ttl:
         return cache[cache_key]['data']
 
     try:
@@ -58,7 +59,6 @@ def fetch_url(url, headers=None, timeout=20, use_cache=True):
         return None
 
 def is_stream_url(url):
-    """Check if a URL is likely a stream URL"""
     url_lower = url.lower()
     for domain in STREAM_DOMAINS:
         if domain in url_lower:
@@ -67,22 +67,23 @@ def is_stream_url(url):
         return True
     return False
 
-def extract_deep_stream_url(stream_page_url, referer=None):
-    """Follow a stream page to extract the actual video URL"""
+def extract_deep_stream(stream_page_url, referer=None):
+    """Extract actual video stream URL from a stream page"""
     headers = dict(HEADERS)
     if referer:
         headers['Referer'] = referer
 
-    html = fetch_url(stream_page_url, headers=headers, use_cache=False)
+    html = fetch_url(stream_page_url, headers=headers, use_cache=True, cache_ttl=DEEP_CACHE_TTL)
     if not html:
         return None
 
-    stream_info = {
+    result = {
         'source_page': stream_page_url,
+        'stream_type': 'unknown',
         'found_urls': []
     }
 
-    # Pattern 1: Look for iframe src (most common)
+    # Pattern 1: iframe src
     iframe_match = re.search(r'<iframe[^>]*src=["\']([^"\']+)["\']', html, re.IGNORECASE)
     if iframe_match:
         iframe_url = iframe_match.group(1)
@@ -90,77 +91,81 @@ def extract_deep_stream_url(stream_page_url, referer=None):
             iframe_url = 'https:' + iframe_url
         elif iframe_url.startswith('/'):
             iframe_url = urljoin(stream_page_url, iframe_url)
-        stream_info['iframe_url'] = iframe_url
-        stream_info['found_urls'].append(iframe_url)
+        result['iframe_url'] = iframe_url
+        result['found_urls'].append(iframe_url)
 
-    # Pattern 2: Look for video source
+    # Pattern 2: video source
     video_match = re.search(r'<video[^>]*src=["\']([^"\']+)["\']', html, re.IGNORECASE)
     if video_match:
-        stream_info['video_url'] = video_match.group(1)
-        stream_info['found_urls'].append(video_match.group(1))
+        result['video_url'] = video_match.group(1)
+        result['found_urls'].append(video_match.group(1))
 
-    # Pattern 3: Look for .m3u8 URLs
+    # Pattern 3: .m3u8 URLs
     m3u8_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', html)
     if m3u8_matches:
-        stream_info['m3u8_urls'] = m3u8_matches
-        stream_info['found_urls'].extend(m3u8_matches)
+        result['m3u8_urls'] = m3u8_matches
+        result['found_urls'].extend(m3u8_matches)
 
-    # Pattern 4: Look for .mp4 URLs
+    # Pattern 4: .mp4 URLs
     mp4_matches = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', html)
     if mp4_matches:
-        stream_info['mp4_urls'] = mp4_matches
-        stream_info['found_urls'].extend(mp4_matches)
+        result['mp4_urls'] = mp4_matches
+        result['found_urls'].extend(mp4_matches)
 
-    # Pattern 5: Look for stream URLs in JavaScript
-    js_stream_patterns = [
+    # Pattern 5: Stream URLs in JS
+    js_patterns = [
         r'src\s*:\s*["\']([^"\']+)["\']',
         r'url\s*:\s*["\']([^"\']+)["\']',
         r'file\s*:\s*["\']([^"\']+)["\']',
         r'["\']([^"\']*\.m3u8[^"\']*)["\']',
+        r'["\']([^"\']*albaplayer[^"\']*)["\']',
+        r'["\']([^"\']*gwoo\.online[^"\']*)["\']',
     ]
-    for pattern in js_stream_patterns:
+    for pattern in js_patterns:
         matches = re.findall(pattern, html)
         for m in matches:
-            if 'http' in m or '.m3u8' in m or '.mp4' in m:
-                if m not in stream_info['found_urls']:
-                    stream_info['found_urls'].append(m)
+            if ('http' in m or '.m3u8' in m or '.mp4' in m or 'player' in m) and m not in result['found_urls']:
+                result['found_urls'].append(m)
 
-    # Pattern 6: Look for jwplayer or videojs config
-    player_match = re.search(r'(?:jwplayer|player)\s*\(\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
-    if player_match:
-        stream_info['player_id'] = player_match.group(1)
+    # Pattern 6: Any http URLs that look like streams
+    http_matches = re.findall(r'https?://[^\s"\'<>]+', html)
+    for m in http_matches:
+        if any(kw in m.lower() for kw in ['player', 'stream', 'live', 'm3u8', 'mp4', 'video', 'gwoo', 'drix']):
+            if m not in result['found_urls']:
+                result['found_urls'].append(m)
 
-    # Remove duplicates while preserving order
+    # Deduplicate and find best URL
     seen = set()
     unique_urls = []
-    for url in stream_info['found_urls']:
+    for url in result['found_urls']:
         if url not in seen and len(url) > 10:
             seen.add(url)
             unique_urls.append(url)
-    stream_info['found_urls'] = unique_urls
+    result['found_urls'] = unique_urls
 
-    # Determine best stream URL
-    if stream_info['found_urls']:
-        # Prefer m3u8, then mp4, then iframe, then others
-        for url in stream_info['found_urls']:
+    # Determine best URL
+    if result['found_urls']:
+        for url in result['found_urls']:
             if '.m3u8' in url:
-                stream_info['best_url'] = url
-                stream_info['stream_type'] = 'hls'
+                result['best_url'] = url
+                result['stream_type'] = 'hls'
                 break
         else:
-            for url in stream_info['found_urls']:
+            for url in result['found_urls']:
                 if '.mp4' in url:
-                    stream_info['best_url'] = url
-                    stream_info['stream_type'] = 'mp4'
+                    result['best_url'] = url
+                    result['stream_type'] = 'mp4'
                     break
             else:
-                stream_info['best_url'] = stream_info['found_urls'][0]
-                stream_info['stream_type'] = 'unknown'
+                result['best_url'] = result['found_urls'][0]
+                if 'iframe' in result:
+                    result['stream_type'] = 'iframe'
+                elif 'player' in result['best_url'].lower():
+                    result['stream_type'] = 'player_page'
 
-    return stream_info
+    return result if result.get('best_url') else None
 
 def extract_ay_match_containers(html):
-    """Extract AY_Match containers by finding start tags and matching end tags"""
     containers = []
     start_pattern = r'<div[^>]*class=["\']([^"\']*AY_Match[^"\']*)["\'][^>]*>'
 
@@ -188,33 +193,13 @@ def extract_ay_match_containers(html):
 
     return containers
 
-def extract_matches_from_html(html, source_name):
-    """Extract matches from AY_Match containers"""
-    if not html:
-        return []
-
-    matches = []
-    containers = extract_ay_match_containers(html)
-
-    for class_name, content in containers:
-        match_info = parse_ay_match_container(content, class_name, source_name)
-        if match_info:
-            matches.append(match_info)
-
-    return matches
-
 def parse_ay_match_container(content, class_name, source_name):
-    """Parse an AY_Match container"""
     if not content or len(content) < 20:
         return None
 
-    info = {
-        'source': source_name,
-        'source_type': 'AY_Match',
-        'status_class': class_name,
-    }
+    info = {'source': source_name, 'source_type': 'AY_Match'}
 
-    # Determine match status
+    # Status
     class_lower = class_name.lower()
     if 'live' in class_lower:
         info['status'] = 'live'
@@ -227,22 +212,21 @@ def parse_ay_match_container(content, class_name, source_name):
     else:
         info['status'] = 'unknown'
 
-    # Extract team names
-    home_team_match = re.search(
+    # Teams
+    home_match = re.search(
         r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM1[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
         content, re.DOTALL | re.IGNORECASE
     )
-    away_team_match = re.search(
+    away_match = re.search(
         r'<div[^>]*class=["\'][^"\']*MT_Team\s+TM2[^"\']*["\'][^>]*>.*?<img[^>]*alt=["\']([^"\']+)["\']',
         content, re.DOTALL | re.IGNORECASE
     )
 
-    if home_team_match:
-        info['home_team'] = home_team_match.group(1).strip()
-    if away_team_match:
-        info['away_team'] = away_team_match.group(1).strip()
+    if home_match:
+        info['home_team'] = home_match.group(1).strip()
+    if away_match:
+        info['away_team'] = away_match.group(1).strip()
 
-    # Fallback: find all img alt attributes
     if 'home_team' not in info or 'away_team' not in info:
         all_alts = re.findall(r'<img[^>]*alt=["\']([^"\']+)["\']', content)
         if len(all_alts) >= 2:
@@ -251,23 +235,22 @@ def parse_ay_match_container(content, class_name, source_name):
         elif len(all_alts) == 1:
             info['home_team'] = all_alts[0].strip()
 
-    # Build teams string
     if 'home_team' in info and 'away_team' in info:
         info['teams'] = f"{info['home_team']} vs {info['away_team']}"
     elif 'home_team' in info:
         info['teams'] = info['home_team']
 
-    # Extract time
+    # Time
     time_match = re.search(r'(\d{1,2}:\d{2})', content)
     if time_match:
         info['time'] = time_match.group(1)
 
-    # Extract score
+    # Score
     score_match = re.search(r'(\d+\s*[-]\s*\d+)', content)
     if score_match:
         info['score'] = score_match.group(1)
 
-    # Extract channel info
+    # Channel
     channel_keywords = ['beIN', 'بي إن', 'bein', 'Abu Dhabi', 'أبو ظبي', 'SSC', 'KSA', 'ON Sport', 'STC', 'دبي', 'Dubai', 'Saudi', 'السعودية']
     content_lower = content.lower()
     for kw in channel_keywords:
@@ -275,12 +258,11 @@ def parse_ay_match_container(content, class_name, source_name):
             info['channel'] = kw
             break
 
-    # Extract and categorize links
+    # Links
     all_links = re.findall(r'href=["\']([^"\']*)["\']', content)
     if all_links:
         absolute_links = []
         stream_links = []
-        match_page_links = []
 
         for link in all_links:
             if link.startswith('http'):
@@ -292,36 +274,37 @@ def parse_ay_match_container(content, class_name, source_name):
                 abs_link = link
 
             absolute_links.append(abs_link)
-
             if is_stream_url(abs_link):
                 stream_links.append(abs_link)
-            else:
-                match_page_links.append(abs_link)
 
         info['all_links'] = absolute_links
         if stream_links:
             info['stream_links'] = stream_links
-            info['stream_url'] = stream_links[0]
-        if match_page_links:
-            info['match_links'] = match_page_links
+            info['stream_page_url'] = stream_links[0]
 
-    # Extract league info
+    # League
     league_match = re.search(r'<div[^>]*class=["\'][^"\']*(?:league|tournament|championship|دوري)[^"\']*["\'][^>]*>(.*?)</div>', content, re.DOTALL | re.IGNORECASE)
     if league_match:
         league_text = re.sub(r'<[^>]+>', '', league_match.group(1)).strip()
         if league_text:
             info['league'] = league_text
 
-    if 'home_team' in info:
-        return info
+    return info if 'home_team' in info else None
 
-    return None
+def extract_matches_from_html(html, source_name):
+    if not html:
+        return []
+    matches = []
+    containers = extract_ay_match_containers(html)
+    for class_name, content in containers:
+        match_info = parse_ay_match_container(content, class_name, source_name)
+        if match_info:
+            matches.append(match_info)
+    return matches
 
 def get_thesportsdb_matches():
-    """Fallback: Get matches from TheSportsDB"""
     matches = []
     league_ids = [4328, 4335, 4331, 4332, 4334, 4337]
-
     for lid in league_ids:
         try:
             data = fetch_url(f"https://www.thesportsdb.com/api/v1/json/3/eventsnextleague.php?id={lid}", use_cache=True)
@@ -342,8 +325,23 @@ def get_thesportsdb_matches():
                     })
         except Exception as e:
             logging.error(f"TheSportsDB error: {e}")
-
     return matches
+
+def enrich_match_with_stream(match):
+    """Automatically extract deep stream URL for a match"""
+    if not match.get('stream_page_url'):
+        return match
+
+    deep = extract_deep_stream(match['stream_page_url'], referer=ARABIC_SOURCES.get(match.get('source', '')))
+    if deep and deep.get('best_url'):
+        match['stream_url'] = deep['best_url']
+        match['stream_type'] = deep.get('stream_type', 'unknown')
+        match['stream_iframe'] = deep.get('iframe_url')
+        match['stream_m3u8'] = deep.get('m3u8_urls', [])
+        match['stream_mp4'] = deep.get('mp4_urls', [])
+        match['stream_all_urls'] = deep.get('found_urls', [])
+
+    return match
 
 # ========== ROUTES ==========
 
@@ -351,30 +349,28 @@ def get_thesportsdb_matches():
 def index():
     return jsonify({
         "status": "online",
-        "message": "Arabic Sports API with deep stream extraction",
-        "sources": list(ARABIC_SOURCES.keys()) + ["thesportsdb"],
+        "message": "Arabic Sports API - Fully Automated Stream Extraction",
+        "endpoints": {
+            "/matches/today": "Today's matches with auto stream URLs",
+            "/matches/live": "Live matches with auto stream URLs",
+            "/streams": "All matches with stream URLs (auto deep extraction)",
+            "/channels/bein": "Bein Sports matches",
+            "/scrape/<source>": "Debug scraper for a source",
+        },
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
 @app.route('/test')
 def test():
-    return jsonify({
-        "status": "ok",
-        "message": "API running",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
+    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
 @app.route('/health')
 def health():
-    return jsonify({
-        "status": "healthy",
-        "cache_entries": len(cache),
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
+    return jsonify({"status": "healthy", "cache_entries": len(cache), "timestamp": datetime.now(timezone.utc).isoformat()})
 
 @app.route('/matches/today')
 def get_today_matches():
-    """Get today's matches with stream links"""
+    """Get today's matches - auto deep stream extraction for live/upcoming"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     all_matches = []
 
@@ -382,6 +378,10 @@ def get_today_matches():
         html = fetch_url(url, use_cache=True)
         if html:
             matches = extract_matches_from_html(html, name)
+            # Auto-enrich live and upcoming matches with stream URLs
+            for m in matches:
+                if m.get('status') in ['live', 'upcoming', 'not_started']:
+                    m = enrich_match_with_stream(m)
             all_matches.extend(matches)
 
     if not all_matches:
@@ -389,19 +389,24 @@ def get_today_matches():
         for m in db_matches:
             if m.get('date') == today:
                 all_matches.append(m)
-
     if not all_matches:
         all_matches = get_thesportsdb_matches()[:20]
 
+    # Sort by status: live first, then upcoming, then not_started, then finished
+    status_order = {'live': 0, 'upcoming': 1, 'not_started': 2, 'finished': 3, 'unknown': 4}
+    all_matches.sort(key=lambda x: status_order.get(x.get('status', 'unknown'), 4))
+
     return jsonify({
         "date": today,
-        "matches": all_matches,
-        "count": len(all_matches)
+        "total_matches": len(all_matches),
+        "live_count": sum(1 for m in all_matches if m.get('status') == 'live'),
+        "upcoming_count": sum(1 for m in all_matches if m.get('status') in ['upcoming', 'not_started']),
+        "matches": all_matches
     })
 
 @app.route('/matches/live')
 def get_live_matches():
-    """Get live matches with stream links"""
+    """Get live matches with auto stream extraction"""
     all_matches = []
 
     for name, url in ARABIC_SOURCES.items():
@@ -410,17 +415,17 @@ def get_live_matches():
             matches = extract_matches_from_html(html, name)
             for m in matches:
                 if m.get('status') == 'live':
-                    m['is_live'] = True
+                    m = enrich_match_with_stream(m)
                     all_matches.append(m)
 
     return jsonify({
-        "matches": all_matches,
-        "count": len(all_matches)
+        "count": len(all_matches),
+        "matches": all_matches
     })
 
 @app.route('/streams')
 def get_all_streams():
-    """Get all matches that have stream URLs"""
+    """Get all matches with stream URLs - auto deep extraction"""
     all_matches = []
 
     for name, url in ARABIC_SOURCES.items():
@@ -428,31 +433,28 @@ def get_all_streams():
         if html:
             matches = extract_matches_from_html(html, name)
             for m in matches:
-                if m.get('stream_url'):
-                    all_matches.append(m)
+                if m.get('stream_page_url'):
+                    m = enrich_match_with_stream(m)
+                    if m.get('stream_url'):
+                        all_matches.append(m)
+
+    # Sort by status
+    status_order = {'live': 0, 'upcoming': 1, 'not_started': 2, 'finished': 3}
+    all_matches.sort(key=lambda x: status_order.get(x.get('status', 'unknown'), 4))
+
+    # Group by status
+    grouped = {}
+    for m in all_matches:
+        status = m.get('status', 'unknown')
+        if status not in grouped:
+            grouped[status] = []
+        grouped[status].append(m)
 
     return jsonify({
-        "matches_with_streams": all_matches,
-        "count": len(all_matches)
+        "total_streams": len(all_matches),
+        "grouped_by_status": grouped,
+        "all_matches": all_matches
     })
-
-@app.route('/stream/deep/<path:url>')
-def get_deep_stream(url):
-    """Deep extraction: follow a stream page to get actual video URL"""
-    decoded_url = unquote(url)
-
-    if not decoded_url.startswith('http'):
-        return jsonify({"error": "Invalid URL"}), 400
-
-    stream_info = extract_deep_stream_url(decoded_url)
-
-    if not stream_info:
-        return jsonify({
-            "error": "Could not extract stream",
-            "url": decoded_url
-        }), 500
-
-    return jsonify(stream_info)
 
 @app.route('/channels/bein')
 def get_bein_matches():
@@ -465,68 +467,63 @@ def get_bein_matches():
             for m in matches:
                 if m.get('channel') or 'bein' in str(m).lower() or 'بي إن' in str(m):
                     m['channel'] = m.get('channel', 'Bein Sports')
+                    if m.get('stream_page_url'):
+                        m = enrich_match_with_stream(m)
                     all_matches.append(m)
 
-    return jsonify({
-        "channel": "Bein Sports",
-        "matches": all_matches,
-        "count": len(all_matches)
-    })
+    return jsonify({"channel": "Bein Sports", "count": len(all_matches), "matches": all_matches})
+
+@app.route('/stream/deep/<path:url>')
+def get_deep_stream(url):
+    """Manual deep extraction for a specific URL"""
+    decoded_url = unquote(url)
+    if not decoded_url.startswith('http'):
+        return jsonify({"error": "Invalid URL"}), 400
+
+    stream_info = extract_deep_stream(decoded_url)
+    if not stream_info:
+        return jsonify({"error": "Could not extract stream", "url": decoded_url}), 500
+
+    return jsonify(stream_info)
 
 @app.route('/scrape/<source_name>')
 def scrape_source(source_name):
-    """Debug: Detailed scrape output"""
     url = ARABIC_SOURCES.get(source_name)
     if not url:
         return jsonify({"error": f"Unknown source: {source_name}"}), 404
 
     html = fetch_url(url, use_cache=False)
     if not html:
-        return jsonify({"error": "Failed to fetch source"}), 500
+        return jsonify({"error": "Failed to fetch"}), 500
 
     matches = extract_matches_from_html(html, source_name)
-    containers = extract_ay_match_containers(html)
-    stream_count = sum(1 for m in matches if m.get('stream_url'))
 
     return jsonify({
         "source": source_name,
-        "url": url,
-        "title": re.search(r'<title>(.*?)</title>', html, re.IGNORECASE).group(1) if re.search(r'<title>(.*?)</title>', html, re.IGNORECASE) else "No title",
-        "content_length": len(html),
         "matches_found": len(matches),
-        "matches_with_streams": stream_count,
         "matches": matches[:10],
-        "raw_container_count": len(containers),
     })
 
 @app.route('/scrape/all')
 def scrape_all_sources():
-    """Quick scrape of all sources"""
     results = {}
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
         if html:
             matches = extract_matches_from_html(html, name)
-            stream_count = sum(1 for m in matches if m.get('stream_url'))
+            stream_count = sum(1 for m in matches if m.get('stream_page_url'))
             results[name] = {
                 "status": "ok",
-                "content_length": len(html),
                 "matches_found": len(matches),
-                "streams_found": stream_count,
-                "title": re.search(r'<title>(.*?)</title>', html, re.IGNORECASE).group(1) if re.search(r'<title>(.*?)</title>', html, re.IGNORECASE) else "No title"
+                "stream_pages_found": stream_count,
             }
         else:
-            results[name] = {"status": "failed", "error": "Could not fetch"}
-
+            results[name] = {"status": "failed"}
     return jsonify(results)
 
 @app.route('/sources')
 def get_sources():
-    return jsonify({
-        "arabic_sources": ARABIC_SOURCES,
-        "backup_sources": ["thesportsdb"],
-        "total": len(ARABIC_SOURCES) + 1
-    })
+    return jsonify({"arabic_sources": ARABIC_SOURCES, "backup_sources": ["thesportsdb"]})
 
 @app.route('/config')
 def get_config():
@@ -566,8 +563,7 @@ def get_channels(cat_id):
 @app.route('/stream/<int:channel_id>')
 def get_stream_legacy(channel_id):
     return jsonify({
-        "error": "Stream URLs unavailable",
-        "message": "Use /streams for matches with stream links, or /stream/deep/<url> to extract actual video URLs.",
+        "error": "Use /streams for auto-extracted stream URLs",
         "channel_id": channel_id
     }), 503
 
@@ -577,19 +573,11 @@ def get_events():
 
 @app.route('/event/<int:event_id>')
 def get_event(event_id):
-    return jsonify({
-        "id": event_id,
-        "message": "Use /matches/today for current match listings",
-        "source": "thesportsdb"
-    })
+    return jsonify({"id": event_id, "message": "Use /matches/today"})
 
 @app.route('/verify/<int:channel_id>')
 def verify_stream(channel_id):
-    return jsonify({
-        "channel_id": channel_id,
-        "status": "unavailable",
-        "message": "Old API is offline. Use /stream/deep/<url> to verify streams."
-    })
+    return jsonify({"channel_id": channel_id, "status": "unavailable", "message": "Use /streams endpoint"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=3000)
