@@ -25,7 +25,17 @@ STREAM_DOMAINS = [
     'beinmatch', 'bein-match', 'beinsports',
     'livestream', 'stream', 'player', 'embed',
     'livekooracom', 'koora-online.mov', 'koray.live',
-    'gwoo.online', 'albaplayer',
+    'gwoo.online', 'albaplayer', 'sport4all',
+]
+
+# URLs to exclude from stream_all_urls
+NOISE_PATTERNS = [
+    r'wp-content', r'wp-includes', r'wp-admin',
+    r'facebook.com', r'twitter.com', r'whatsapp.com', r'telegram.me',
+    r'feed/', r'comments/feed',
+    r'\.css', r'\.js', r'\.woff', r'\.png', r'\.jpg', r'\.webp', r'\.gif',
+    r'\.jpeg', r'\.svg', r'\.ico',
+    r'sharer\.php', r'share\?url', r'intent/tweet',
 ]
 
 HEADERS = {
@@ -37,7 +47,7 @@ HEADERS = {
 
 cache = {}
 CACHE_TTL = 300
-DEEP_CACHE_TTL = 60  # Stream URLs expire quickly
+DEEP_CACHE_TTL = 60
 
 # ========== UTILITIES ==========
 
@@ -65,6 +75,13 @@ def is_stream_url(url):
             return True
     if any(ext in url_lower for ext in ['.m3u8', '.mp4', '.ts', 'stream', 'live', 'play', 'embed']):
         return True
+    return False
+
+def is_noise_url(url):
+    """Check if URL is noise (assets, social shares, etc.)"""
+    for pattern in NOISE_PATTERNS:
+        if re.search(pattern, url, re.IGNORECASE):
+            return True
     return False
 
 def extract_deep_stream(stream_page_url, referer=None):
@@ -112,7 +129,7 @@ def extract_deep_stream(stream_page_url, referer=None):
         result['mp4_urls'] = mp4_matches
         result['found_urls'].extend(mp4_matches)
 
-    # Pattern 5: Stream URLs in JS
+    # Pattern 5: Stream URLs in JS - broader patterns
     js_patterns = [
         r'src\s*:\s*["\']([^"\']+)["\']',
         r'url\s*:\s*["\']([^"\']+)["\']',
@@ -120,25 +137,27 @@ def extract_deep_stream(stream_page_url, referer=None):
         r'["\']([^"\']*\.m3u8[^"\']*)["\']',
         r'["\']([^"\']*albaplayer[^"\']*)["\']',
         r'["\']([^"\']*gwoo\.online[^"\']*)["\']',
+        r'["\']([^"\']*sport4all[^"\']*)["\']',
+        r'["\']([^"\']*drix\.online[^"\']*)["\']',
     ]
     for pattern in js_patterns:
         matches = re.findall(pattern, html)
         for m in matches:
-            if ('http' in m or '.m3u8' in m or '.mp4' in m or 'player' in m) and m not in result['found_urls']:
+            if ('http' in m or '.m3u8' in m or '.mp4' in m or 'player' in m or 'stream' in m) and m not in result['found_urls']:
                 result['found_urls'].append(m)
 
     # Pattern 6: Any http URLs that look like streams
     http_matches = re.findall(r'https?://[^\s"\'<>]+', html)
     for m in http_matches:
-        if any(kw in m.lower() for kw in ['player', 'stream', 'live', 'm3u8', 'mp4', 'video', 'gwoo', 'drix']):
-            if m not in result['found_urls']:
+        if any(kw in m.lower() for kw in ['player', 'stream', 'live', 'm3u8', 'mp4', 'video', 'gwoo', 'drix', 'sport4all']):
+            if m not in result['found_urls'] and not is_noise_url(m):
                 result['found_urls'].append(m)
 
     # Deduplicate and find best URL
     seen = set()
     unique_urls = []
     for url in result['found_urls']:
-        if url not in seen and len(url) > 10:
+        if url not in seen and len(url) > 10 and not is_noise_url(url):
             seen.add(url)
             unique_urls.append(url)
     result['found_urls'] = unique_urls
@@ -240,15 +259,20 @@ def parse_ay_match_container(content, class_name, source_name):
     elif 'home_team' in info:
         info['teams'] = info['home_team']
 
-    # Time
+    # Time - look for HH:MM format
     time_match = re.search(r'(\d{1,2}:\d{2})', content)
     if time_match:
         info['time'] = time_match.group(1)
 
-    # Score
-    score_match = re.search(r'(\d+\s*[-]\s*\d+)', content)
+    # Score - ONLY match patterns like "0 - 0", "2-1", "1 - 2" with small numbers
+    # Avoid matching dates like "2026-06" or "3-2026"
+    score_match = re.search(r'(\d{1,2})\s*[-]\s*(\d{1,2})', content)
     if score_match:
-        info['score'] = score_match.group(1)
+        num1 = int(score_match.group(1))
+        num2 = int(score_match.group(2))
+        # Only accept if both numbers are reasonable scores (0-20)
+        if num1 <= 20 and num2 <= 20:
+            info['score'] = f"{num1} - {num2}"
 
     # Channel
     channel_keywords = ['beIN', 'بي إن', 'bein', 'Abu Dhabi', 'أبو ظبي', 'SSC', 'KSA', 'ON Sport', 'STC', 'دبي', 'Dubai', 'Saudi', 'السعودية']
@@ -258,7 +282,7 @@ def parse_ay_match_container(content, class_name, source_name):
             info['channel'] = kw
             break
 
-    # Links
+    # Links - extract and filter noise
     all_links = re.findall(r'href=["\']([^"\']*)["\']', content)
     if all_links:
         absolute_links = []
@@ -273,11 +297,13 @@ def parse_ay_match_container(content, class_name, source_name):
             else:
                 abs_link = link
 
-            absolute_links.append(abs_link)
-            if is_stream_url(abs_link):
-                stream_links.append(abs_link)
+            if not is_noise_url(abs_link):
+                absolute_links.append(abs_link)
+                if is_stream_url(abs_link):
+                    stream_links.append(abs_link)
 
-        info['all_links'] = absolute_links
+        if absolute_links:
+            info['links'] = absolute_links
         if stream_links:
             info['stream_links'] = stream_links
             info['stream_page_url'] = stream_links[0]
@@ -339,7 +365,8 @@ def enrich_match_with_stream(match):
         match['stream_iframe'] = deep.get('iframe_url')
         match['stream_m3u8'] = deep.get('m3u8_urls', [])
         match['stream_mp4'] = deep.get('mp4_urls', [])
-        match['stream_all_urls'] = deep.get('found_urls', [])
+        # Only include non-noise URLs
+        match['stream_all_urls'] = [u for u in deep.get('found_urls', []) if not is_noise_url(u)]
 
     return match
 
@@ -349,13 +376,12 @@ def enrich_match_with_stream(match):
 def index():
     return jsonify({
         "status": "online",
-        "message": "Arabic Sports API - Fully Automated Stream Extraction",
+        "message": "Arabic Sports API - Clean Stream Extraction",
         "endpoints": {
             "/matches/today": "Today's matches with auto stream URLs",
             "/matches/live": "Live matches with auto stream URLs",
             "/streams": "All matches with stream URLs (auto deep extraction)",
             "/channels/bein": "Bein Sports matches",
-            "/scrape/<source>": "Debug scraper for a source",
         },
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
@@ -481,6 +507,7 @@ def get_deep_stream(url):
         return jsonify({"error": "Invalid URL"}), 400
 
     stream_info = extract_deep_stream(decoded_url)
+
     if not stream_info:
         return jsonify({"error": "Could not extract stream", "url": decoded_url}), 500
 
@@ -488,6 +515,7 @@ def get_deep_stream(url):
 
 @app.route('/scrape/<source_name>')
 def scrape_source(source_name):
+    """Debug: Detailed scrape output"""
     url = ARABIC_SOURCES.get(source_name)
     if not url:
         return jsonify({"error": f"Unknown source: {source_name}"}), 404
@@ -506,6 +534,7 @@ def scrape_source(source_name):
 
 @app.route('/scrape/all')
 def scrape_all_sources():
+    """Quick scrape of all sources"""
     results = {}
     for name, url in ARABIC_SOURCES.items():
         html = fetch_url(url, use_cache=True)
